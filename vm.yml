@@ -1,0 +1,7 @@
+---
+install_drive: /dev/sda
+boot_partition_suffix: '1'
+root_partition_suffix: '2'
+hostname: 'virtual-arch'
+user_name: michal
+user_password: '$6$aFggCzsnaa/Cu$z5R1QfNqZPkGm10Ym4v9BoryWXkRVFSj53N/oKHNOe3X3b6uPmdU/5vl/nMzQb7FI/TKAIqya4i8OiiDoCudJ0'

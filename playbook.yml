@@ -1,0 +1,228 @@
+---
+- hosts: all
+  vars_files:
+    - vm.yml
+  tasks:
+    - name: Abort if the host is not booted from the Arch install media
+      fail:
+        msg: "This host is not booted from the Arch install media!"
+      when: ansible_nodename != 'archiso'
+      tags:
+        - quick_exit
+    - name: Synchronize clock via NTP
+      command: timedatectl set-ntp true
+      tags:
+        - sync_clock
+    - name: Repartition install drive
+      block:
+        - name: Wipe install drive and all its partitions
+          command: find /dev -wholename "{{ install_drive }}*" -exec wipefs --force --all {} \;
+          tags:
+            - wipefs
+        - name: Create boot partition
+          parted:
+            device: '{{ install_drive }}'
+            label: gpt
+            number: 1
+            part_end: 512MB
+            name: boot
+            flags: [boot, esp]
+            state: present
+        - name: Create root partition
+          parted:
+            device: '{{ install_drive }}'
+            label: gpt
+            number: 2
+            part_start: 512MB
+            name: root
+            flags: [lvm]
+            state: present
+      tags:
+        - repartition
+    - name: Create filesystems
+      block:
+        - name: Create FAT32 filesystem in boot partition
+          filesystem:
+            dev: '{{ install_drive }}{{ boot_partition_suffix }}'
+            fstype: vfat
+            opts: -F32
+            force: yes
+        - name: Create ext4 filesystem in root volume
+          filesystem:
+            dev: '{{ install_drive }}{{ root_partition_suffix }}'
+            fstype: ext4
+            force: yes
+        - name: Get UUID for boot filesystem
+          command: blkid -s UUID -o value '{{ install_drive }}{{ boot_partition_suffix }}'
+          register: boot_uuid
+          changed_when: false
+        - name: Get UUID for root filesystem
+          command: blkid -s UUID -o value '{{ install_drive }}{{ root_partition_suffix }}'
+          register: root_uuid
+          changed_when: false
+      tags:
+        - create_filesystems
+    
+    - name: Mount filesystems
+      block:
+        - name: Mount root filesystem
+          mount:
+            path: /mnt
+            src: UUID={{ root_uuid.stdout }}
+            fstype: ext4
+            state: mounted
+        - name: Create mountpoint for boot volume
+          file:
+            path: /mnt/boot
+            state: directory
+        - name: Mount boot filesystem
+          mount:
+            path: /mnt/boot
+            src: UUID={{ boot_uuid.stdout }}
+            fstype: vfat
+            state: mounted
+      tags:
+        - mount_filesystems
+    - name: Run pacstrap
+      command: pacstrap /mnt base efibootmgr grub linux linux-firmware openssh python reflector sudo vim htop networkmanager network-manager-applet
+      tags:
+        - pacstrap
+    - name: Restrict reflector to only CZ mirrors
+      ansible.builtin.lineinfile:
+        insertafter: \# --country
+        line: --country "Czechia"
+        path: /mnt/etc/xdg/reflector/reflector.conf
+      tags:
+        - mirrors
+    - name: Generate fstab
+      block:
+        - name: Generate blank fstab
+          command: genfstab -U /mnt >> /mnt/etc/fstab
+        - name: Add root volume to fstab
+          mount:
+            fstab: /mnt/etc/fstab
+            path: /
+            src: UUID={{ root_uuid.stdout }}
+            fstype: ext4
+            opts: defaults
+            passno: '1'
+            state: present
+        - name: Add boot volume to fstab
+          mount:
+            fstab: /mnt/etc/fstab
+            path: /boot
+            src: UUID={{ boot_uuid.stdout }}
+            fstype: vfat
+            opts: defaults
+            passno: '2'
+            state: present
+      tags:
+        - fstab
+    - name: Set local timezone
+      command: arch-chroot /mnt ln -sf /usr/share/zoneinfo/Europe/Prague /etc/localtime
+      tags:
+        - timezone
+    - name: Generate adjtime file
+      command: arch-chroot /mnt hwclock --systohc
+      tags:
+        - adjtime
+    - name: Setup locales
+      block:
+        - name: Configure locale.gen
+          lineinfile:
+            dest: /mnt/etc/locale.gen
+            regexp: '{{ item.regex }}'
+            line: '{{ item.line }}'
+          loop:
+            - {regex: en_US\.UTF-8 UTF-8, line: en_US.UTF-8 UTF-8}
+            - {regex: en_US ISO-8859-1, line: en_US ISO-8859-1}
+        - name: Create locale.conf
+          copy:
+            content: "LANG=en_US.UTF-8"
+            dest: /mnt/etc/locale.conf
+        - name: Generate locales
+          command: arch-chroot /mnt locale-gen
+      tags:
+        - locales
+    - name: Set hostname
+      copy:
+        content: '{{ hostname }}'
+        dest: /mnt/etc/hostname
+      tags:
+        - hostname
+    - name: Enable sshd
+      command: arch-chroot /mnt systemctl enable sshd
+      tags:
+        - sshd
+    - name: Enable networkmanager
+      command: arch-chroot /mnt systemctl enable NetworkManager
+    - name: Set up initramfs
+      block:
+        # - name: Add mkinitcpio.conf hooks
+        #   lineinfile:
+        #     dest: /mnt/etc/mkinitcpio.conf
+        #     regexp: ^HOOKS=
+        #     line: HOOKS=(base udev autodetect keyboard keymap modconf block encrypt lvm2 filesystems fsck)
+        - name: Create new initramfs
+          command: arch-chroot /mnt mkinitcpio -p linux
+      tags:
+        - initramfs
+        - mkinitcpio
+    - name: Set up grub
+      block:
+        - name: Add commandline information to grub config
+          lineinfile:
+            dest: /mnt/etc/default/grub
+            regexp: ^GRUB_CMDLINE_LINUX_DEFAULT=
+            line: 'GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3"'
+        - name: Install grub
+          command: arch-chroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+        - name: Create grub config
+          command: arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
+      tags:
+        - grub
+    - name: Setup user account
+      block:
+        - name: Create user account
+          command: arch-chroot /mnt useradd --create-home --user-group --groups wheel {{ user_name }} --password {{ user_password }}
+        - name: Create user's ssh directory
+          file:
+            path: /mnt/home/{{ user_name }}/.ssh
+            state: directory
+        - name: Set mode, owner, and group on user's ssh directory
+          command: arch-chroot /mnt {{ item }}
+          loop:
+            - chmod 0700 /home/{{ user_name }}/.ssh
+            - chown {{ user_name }}:{{ user_name }} /home/{{ user_name }}/.ssh
+        - name: Copy over ssh key from current Ansible controller as an authorized key
+          copy:
+            src: '{{ lookup("env", "HOME") }}/.ssh/id_ed25519.pub'
+            dest: /mnt/home/{{ user_name }}/.ssh/authorized_keys
+          register: copyssh
+          ignore_errors: true
+        - name: Set mode, owner, and group on user's authorized_key file
+          command: arch-chroot /mnt {{ item }}
+          loop:
+            - chmod 0600 /home/{{ user_name }}/.ssh/authorized_keys
+            - chown {{ user_name }}:{{ user_name }} /home/{{ user_name }}/.ssh/authorized_keys
+          when: copyssh.changed
+          ignore_errors: true
+      tags:
+        - user_account
+    - name: Give passwordless sudo access to wheel group
+      copy:
+        content: '%wheel ALL=(ALL) NOPASSWD: ALL'
+        dest: /mnt/etc/sudoers.d/wheel
+        validate: /usr/sbin/visudo --check --file=%s
+      tags:
+        - sudo
+
+- hosts: all
+  tasks:
+    - name: Reboot
+      reboot:
+        connect_timeout: 1
+        reboot_timeout: 1
+      failed_when: false
+      tags:
+        - reboot
